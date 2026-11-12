@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Entry Timer for trader-entry: watches a setup bar by bar and says the
-moment to get in. Standard library only. Long side only. It never places an order.
+moment to get in. Standard library only. Longs by default, --side sell for
+shorts. Prices from Yahoo or Capital.com (--source capital). It never places an order.
 
     python3 entry.py check TSLA                          # opening-range breakout, 5-minute bars
     python3 entry.py check TSLA --now "2026-10-19 10:15" --offline TSLA.json
@@ -9,7 +10,7 @@ moment to get in. Standard library only. Long side only. It never places an orde
     python3 entry.py watch TSLA --every 30 --until 15:30  # one line per closed bar
     python3 entry.py watchlist                            # every hit in trader/watchlist.json
 
-Setups (v2 plans longs only):
+Setups (long; --side sell mirrors each one: the first close BELOW the range low or level):
   orb    opening-range breakout. The range is the high and low of the first
          --or-minutes (default 15: the 9:30, 9:35 and 9:40 five-minute bars).
          It triggers on the first COMPLETED bar after the range that CLOSES
@@ -351,8 +352,161 @@ def offline_file(path, sym):
     return path
 
 
-def get_chart(sym, interval, day=None, offline=None, today=None):
-    """Bars for one ticker, from Yahoo (range=1d for today) or a saved file."""
+# ---------------------------------------------------------------- Capital.com
+
+CAPITAL_BASE = {"live": "https://api-capital.backend-capital.com/api/v1",
+                "demo": "https://demo-api-capital.backend-capital.com/api/v1"}
+CAPITAL_RES = {"1m": "MINUTE", "5m": "MINUTE_5"}
+_CAPITAL = {}   # session tokens: {"base", "CST", "X-SECURITY-TOKEN"}
+
+
+def capital_base():
+    """Demo unless CAPITAL_DEMO is 0 / false / live: the demo account first."""
+    demo = os.environ.get("CAPITAL_DEMO", "1").strip().lower() not in ("0", "false", "no", "live")
+    return CAPITAL_BASE["demo" if demo else "live"]
+
+
+def _capital_http(method, url, headers, body=None, timeout=20):
+    """(status, headers, text). HTTP errors come back as a status, not an exception."""
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    h = {"User-Agent": UA, "Accept": "application/json"}
+    if data is not None:
+        h["Content-Type"] = "application/json"
+    h.update(headers)
+    req = urllib.request.Request(url, data=data, headers=h, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, dict(r.headers), r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        try:
+            text = e.read().decode("utf-8", "replace")
+        except Exception:
+            text = ""
+        finally:
+            e.close()
+        return e.code, dict(e.headers or {}), text
+    except urllib.error.URLError as e:
+        raise EntryError("could not reach Capital.com (%s): %s" % (url.split("/api/")[0], e.reason))
+    except OSError as e:
+        raise EntryError("network error talking to Capital.com: %s" % (e,))
+
+
+def _capital_error(status, text):
+    try:
+        code = (json.loads(text) or {}).get("errorCode")
+    except (ValueError, AttributeError):
+        code = None
+    return "HTTP %d%s" % (status, (" (%s)" % code) if code else "")
+
+
+def capital_login():
+    """POST /session with the API key, login and password from the environment.
+    Keys live in environment variables, never in the chat or a file in the repo."""
+    key = os.environ.get("CAPITAL_API_KEY")
+    ident = os.environ.get("CAPITAL_IDENTIFIER")
+    pw = os.environ.get("CAPITAL_PASSWORD")
+    missing = [n for n, v in (("CAPITAL_API_KEY", key), ("CAPITAL_IDENTIFIER", ident),
+                              ("CAPITAL_PASSWORD", pw)) if not v]
+    if missing:
+        raise EntryError("--source capital needs %s in the environment (the API key from Capital.com's "
+                         "Settings > API integrations, your login email and the key's custom password)"
+                         % ", ".join(missing))
+    base = capital_base()
+    status, hdr, text = _capital_http("POST", base + "/session", {"X-CAP-API-KEY": key},
+                                      {"identifier": ident, "password": pw, "encryptedPassword": False})
+    if status != 200:
+        raise EntryError("Capital.com refused the login: %s%s" % (
+            _capital_error(status, text), "" if "demo" not in base else " on the DEMO server (CAPITAL_DEMO=0 for live)"))
+    low = {k.lower(): v for k, v in hdr.items()}
+    if not low.get("cst") or not low.get("x-security-token"):
+        raise EntryError("Capital.com's login answer had no session tokens")
+    _CAPITAL.clear()
+    _CAPITAL.update({"base": base, "CST": low["cst"], "X-SECURITY-TOKEN": low["x-security-token"]})
+
+
+def capital_get(path):
+    """GET with the session tokens: logs in when needed, once more on a 401
+    (sessions end after 10 idle minutes), one retry after BACKOFF on a 429."""
+    for attempt in range(3):
+        if not _CAPITAL or _CAPITAL.get("base") != capital_base():
+            capital_login()
+        status, _, text = _capital_http("GET", _CAPITAL["base"] + path, {
+            "CST": _CAPITAL["CST"], "X-SECURITY-TOKEN": _CAPITAL["X-SECURITY-TOKEN"]})
+        if status == 200:
+            return text
+        if status == 401 and attempt == 0:
+            _CAPITAL.clear()
+            continue
+        if status == 429 and attempt < 2:
+            _sleep(BACKOFF)
+            continue
+        if status == 404:
+            raise EntryError("Capital.com has no market %s: find its epic with `entry.py epics NAME --source capital`"
+                             % path.split("/")[2].split("?")[0])
+        raise EntryError("Capital.com answered %s for %s" % (_capital_error(status, text), path.split("?")[0]))
+    raise EntryError("Capital.com did not answer: wait a minute and try again")
+
+
+def _cap_time(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def capital_prices_path(epic, interval, day):
+    """One NYSE session of 1- or 5-minute bars, 9:30 to the close, UTC times."""
+    s = session(day) or (OPEN, CLOSE)
+    frm = eastern_to_utc(datetime.datetime.combine(day, s[0]))
+    to = eastern_to_utc(datetime.datetime.combine(day, s[1]))
+    return "/prices/%s?resolution=%s&max=1000&from=%s&to=%s" % (
+        urllib.request.quote(epic, safe=""), CAPITAL_RES[interval], _cap_time(frm), _cap_time(to))
+
+
+def _mid(p):
+    if not isinstance(p, dict):
+        return None
+    bid, ask = p.get("bid"), p.get("ask")
+    if bid is None and ask is None:
+        return None
+    if bid is None or ask is None:
+        return float(bid if ask is None else ask)
+    return (float(bid) + float(ask)) / 2.0
+
+
+def parse_capital(text, sym, interval, data_time=None):
+    """Capital.com /prices JSON -> the same chart shape as parse_chart. Prices are
+    the mid of bid and ask; snapshotTimeUTC is each bar's start."""
+    try:
+        doc = json.loads(text)
+        prices = doc["prices"]
+    except (ValueError, KeyError, TypeError):
+        raise EntryError("Capital.com returned something unexpected for %s" % sym)
+    bars = []
+    for p in prices or []:
+        try:
+            t = datetime.datetime.strptime(str(p["snapshotTimeUTC"])[:19], "%Y-%m-%dT%H:%M:%S")
+        except (KeyError, ValueError):
+            continue
+        c = _mid(p.get("closePrice"))
+        if c is None:
+            continue
+        o, h, lo = _mid(p.get("openPrice")), _mid(p.get("highPrice")), _mid(p.get("lowPrice"))
+        bars.append({"t": ts_of(t), "o": c if o is None else o, "h": c if h is None else h,
+                     "l": c if lo is None else lo, "c": c, "v": int(p.get("lastTradedVolume") or 0)})
+    bars.sort(key=lambda b: b["t"])
+    if data_time is None and bars:
+        data_time = bars[-1]["t"]   # a saved file: its last bar may still have been forming
+    return {"symbol": str(doc.get("epic") or sym).upper(), "source": "capital",
+            "meta": {"symbol": sym, "dataGranularity": interval}, "bars": bars,
+            "prev_close": None, "data_time": data_time}
+
+
+def capital_epics(term):
+    doc = json.loads(capital_get("/markets?searchTerm=%s" % urllib.request.quote(term, safe="")))
+    return [(m.get("epic"), m.get("instrumentName"), m.get("instrumentType"), m.get("marketStatus"))
+            for m in (doc.get("markets") or [])]
+
+
+def get_chart(sym, interval, day=None, offline=None, today=None, source="yahoo"):
+    """Bars for one ticker, from Yahoo (range=1d for today), Capital.com, or a saved file."""
     sym = sym.upper()
     if offline:
         f = offline_file(offline, sym)
@@ -360,6 +514,15 @@ def get_chart(sym, interval, day=None, offline=None, today=None):
             text = read_text(f)
         except (OSError, ValueError) as e:
             raise EntryError("could not read %s: %s" % (f, e))
+        if '"prices"' in text[:200] and '"chart"' not in text[:200]:
+            return parse_capital(text, sym, interval)
+    elif source == "capital":
+        today = today or to_eastern(utc_now()).date()
+        fetched = int(time.time())
+        ch = parse_capital(capital_get(capital_prices_path(sym, interval, day or today)), sym, interval,
+                           data_time=fetched)
+        ch["demo"] = "demo-" in _CAPITAL.get("base", "")
+        return ch
     else:
         today = today or to_eastern(utc_now()).date()
         text = yahoo_get(chart_path(sym, chart_range(day or today, today, interval), interval))
@@ -405,10 +568,26 @@ def early_cutoff(day, t, close_dt):
     return moved if moved.time() > OPEN else close_dt
 
 
+def beyond(c, lvl, side):
+    """A close past the level: above it for a buy, below it for a sell. At it is neither."""
+    return c > lvl if side == "buy" else c < lvl
+
+
+def words(side, setup):
+    """(past, edge): "above" / "the range high" for a buy, "below" / "the range low" for a sell."""
+    past = "above" if side == "buy" else "below"
+    edge = ("the range high" if side == "buy" else "the range low") if setup == "orb" else "the level"
+    return past, edge
+
+
 def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=None,
-             min_volume_x=None, cfg=None):
+             min_volume_x=None, cfg=None, side="buy"):
     """Pure function: the setup's status at now_utc from one session's bars."""
     cfg = cfg or dict(DEFAULTS)
+    if side not in ("buy", "sell"):
+        raise EntryError("--side is buy or sell")
+    past, edge = words(side, setup)
+    src = "Capital.com" if chart.get("source") == "capital" else "Yahoo"
     if interval not in INTERVALS:
         raise EntryError("--interval is 5m or 1m")
     step = INTERVALS[interval]
@@ -421,7 +600,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     n_or = or_minutes * 60 // step
     local = to_eastern(now_utc)
     day = local.date()
-    res = {"symbol": chart["symbol"], "setup": setup, "side": "buy", "date": day.isoformat(),
+    res = {"symbol": chart["symbol"], "setup": setup, "side": side, "source": chart.get("source") or "yahoo", "demo": bool(chart.get("demo")), "date": day.isoformat(),
            "interval": interval, "or_minutes": or_minutes, "now": local.strftime("%Y-%m-%d %H:%M:%S"), "status": "waiting",
            "phase": "", "reason": "", "opening_range": None, "level": None, "trigger": None,
            "last": None, "forming": None, "min_volume_x": min_volume_x,
@@ -491,9 +670,9 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                 len(or_bars), n_or, short(or_end)))
             return res
         if not or_bars:
-            res.update(status="no-data", phase="open", reason="Yahoo sent no bars for the opening range")
+            res.update(status="no-data", phase="open", reason="%s sent no bars for the opening range" % src)
             return res
-        lvl = max(b["h"] for b in or_bars)
+        lvl = max(b["h"] for b in or_bars) if side == "buy" else min(b["l"] for b in or_bars)
     else:
         lvl = float(level)
     res["level"] = r2(lvl)
@@ -503,7 +682,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     for b in bars:
         if b["slot"] < first_slot or b["end"] < before or b["end"] > cutoff:
             continue
-        if b["c"] > lvl:
+        if beyond(b["c"], lvl, side):
             vx = (b["v"] / avg_vol) if avg_vol else None
             if min_volume_x and (vx is None or vx < min_volume_x):
                 thin.append(b)
@@ -518,36 +697,35 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     if trig:
         vx = (trig["v"] / avg_vol) if avg_vol else None
         res.update(status="triggered", phase="open" if local < close_dt else "after-close",
-                   reason="the %s bar closed above %s" % (short(trig["et"]), "the range high" if setup == "orb" else "the level"))
+                   reason="the %s bar closed %s %s" % (short(trig["et"]), past, edge))
         res["trigger"] = {"time": ampm(trig["end"]), "close_time": hm(trig["end"]), "bar_start": hm(trig["et"]),
                           "bar_index": trig["slot"], "price": r2(trig["c"]), "close": trig["c"],
                           "volume": trig["v"], "volume_x": r2(vx), "pct_over": r2(100.0 * (trig["c"] / lvl - 1))}
         res["minutes_since"] = int((local - trig["end"]).total_seconds() // 60)
         if dt and utc_of(dt) < eastern_to_utc(trig["end"]):
-            res["data_note"] = ("Yahoo's last trade is %s, before this bar closed: its close can still move a cent or two"
-                                % to_eastern(utc_of(dt)).strftime("%H:%M:%S"))
+            res["data_note"] = ("%s's last trade is %s, before this bar closed: its close can still move a cent or two"
+                                % (src, to_eastern(utc_of(dt)).strftime("%H:%M:%S")))
         return res
     if not bars:
-        res.update(status="no-data", phase="open", reason="Yahoo sent no bars for %s yet" % day.isoformat())
+        res.update(status="no-data", phase="open", reason="%s sent no bars for %s yet" % (src, day.isoformat()))
         return res
-    what = "close above the range high $%.2f" % lvl if setup == "orb" else "close above $%.2f" % lvl
+    what = "close %s %s $%.2f" % (past, edge, lvl) if setup == "orb" else "close %s $%.2f" % (past, lvl)
     if local >= cutoff and not (pending and pending["end"] <= cutoff):
         res.update(status="expired", phase="after-close" if local >= close_dt else "after-cutoff",
                    reason="no %s by %s, the last time for a new entry%s" % (
                        what, short(cutoff), " (1:00 p.m. early close today)" if early else ""))
         return res
     res["phase"] = "open"
-    if last["c"] > lvl and last in thin:
-        res["reason"] = "the %s bar closed above at $%.2f but on %.2fx the range's volume, under your %.2fx" % (
-            short(last["et"]), last["c"], last["v"] / avg_vol if avg_vol else 0, min_volume_x)
-    elif last["c"] > lvl and last["end"] < before:
-        res["reason"] = "the %s bar closed above at $%.2f, but no entries before %s (config)" % (
-            short(last["et"]), last["c"], short(before))
+    if beyond(last["c"], lvl, side) and last in thin:
+        res["reason"] = "the %s bar closed %s at $%.2f but on %.2fx the range's volume, under your %.2fx" % (
+            short(last["et"]), past, last["c"], last["v"] / avg_vol if avg_vol else 0, min_volume_x)
+    elif beyond(last["c"], lvl, side) and last["end"] < before:
+        res["reason"] = "the %s bar closed %s at $%.2f, but no entries before %s (config)" % (
+            short(last["et"]), past, last["c"], short(before))
     else:
         gap = lvl - last["c"]
-        res["reason"] = "last close $%.2f (%s bar), $%.2f %s %s (%+.2f%%)" % (
-            last["c"], short(last["et"]), abs(gap), "under" if gap >= 0 else "over",
-            "the range high $%.2f" % lvl if setup == "orb" else "the level $%.2f" % lvl,
+        res["reason"] = "last close $%.2f (%s bar), $%.2f %s %s $%.2f (%+.2f%%)" % (
+            last["c"], short(last["et"]), abs(gap), "under" if gap >= 0 else "over", edge, lvl,
             100.0 * (last["c"] / lvl - 1))
     return res
 
@@ -561,12 +739,12 @@ def entry_doc(res, now_utc):
     """trader/entry.json, the contract shape (plus a plain-words reason)."""
     t = res.get("trigger") or {}
     orr = res.get("opening_range")
-    return {"created_by": "trader-entry", "symbol": res["symbol"], "setup": res["setup"], "side": "buy",
+    return {"created_by": "trader-entry", "symbol": res["symbol"], "setup": res["setup"], "side": res.get("side", "buy"),
             "date": res["date"], "status": res["status"], "time": t.get("time"), "bar_start": t.get("bar_start"),
             "bar_index": t.get("bar_index"), "price": t.get("price"), "level": res.get("level"),
             "interval": res["interval"],
             "opening_range": {"high": orr["high"], "low": orr["low"], "minutes": orr["minutes"]} if orr else None,
-            "source": "yahoo", "checked_at": iso(now_utc), "reason": res.get("reason")}
+            "source": res.get("source", "yahoo"), "checked_at": iso(now_utc), "reason": res.get("reason")}
 
 
 def write_json(path, doc):
@@ -587,16 +765,20 @@ SHORT = {"pre-open": "not open", "forming": "forming", "closed": "closed"}
 
 def setup_name(res):
     if res["setup"] == "orb":
-        return "opening-range breakout (%d-minute range)" % res["or_minutes"]
-    return "close above $%.2f" % res["level"] if res["level"] is not None else "close above a level"
+        return "opening-range %s (%d-minute range)" % (
+            "breakout" if res.get("side", "buy") == "buy" else "breakdown, short side", res["or_minutes"])
+    past = words(res.get("side", "buy"), res["setup"])[0]
+    return "close %s $%.2f" % (past, res["level"]) if res["level"] is not None else "close %s a level" % past
 
 
 def describe(res):
     """Plain lines for a person."""
     when = datetime.datetime.strptime(res["now"], "%Y-%m-%d %H:%M:%S")
     bars = "5-minute" if res["interval"] == "5m" else "1-minute"
-    head = "%s  %s %s ET  %s on %s bars (Yahoo, free, can lag)" % (
-        res["symbol"], when.strftime("%a %Y-%m-%d"), when.strftime("%H:%M"), setup_name(res), bars)
+    feed = ("Capital.com %s, mid of bid and ask" % ("DEMO" if res.get("demo") else "prices")
+            if res.get("source") == "capital" else "Yahoo, free, can lag")
+    head = "%s  %s %s ET  %s on %s bars (%s)" % (
+        res["symbol"], when.strftime("%a %Y-%m-%d"), when.strftime("%H:%M"), setup_name(res), bars, feed)
     if res.get("data_time") and res["data_time"] <= res["now"] and res["data_time"][:10] == res["date"]:
         head += ", data to %s" % res["data_time"][11:]
     out = [head]
@@ -610,9 +792,10 @@ def describe(res):
     label = PHASE_LABEL.get(res["phase"]) or LABEL.get(res["status"], res["status"].upper())
     t = res.get("trigger")
     if t:
-        out.append("TRIGGERED %s at $%.2f: the %s bar (bar %d) closed above %s $%.2f (%+.2f%%%s)." % (
+        past, edge = words(res.get("side", "buy"), res["setup"])
+        out.append("TRIGGERED %s at $%.2f: the %s bar (bar %d) closed %s %s $%.2f (%+.2f%%%s)." % (
             t["time"], t["price"], short(datetime.datetime.strptime(t["bar_start"], "%H:%M")), t["bar_index"],
-            "the range high" if res["setup"] == "orb" else "the level", res["level"], t["pct_over"],
+            past, edge, res["level"], t["pct_over"],
             (", %.2fx the range's volume" % t["volume_x"]) if res.get("min_volume_x") and t.get("volume_x") else ""))
         step = INTERVALS[res["interval"]] // 60
         if res.get("minutes_since", 0) > step and res.get("last"):
@@ -625,8 +808,12 @@ def describe(res):
             out.append("Nothing was placed.")
         else:
             out.append("This is the moment to get in, if you take the trade. Nothing was placed.")
-        out.append("Next: set the stop and target BEFORE you buy: /trader-exit "
-                   "(exit.py plan --from trader/entry.json).")
+        if res.get("side", "buy") == "buy":
+            out.append("Next: set the stop and target BEFORE you buy: /trader-exit "
+                       "(exit.py plan --from trader/entry.json).")
+        else:
+            out.append("Next: set the stop ABOVE and the target BELOW in your broker's app BEFORE you sell. "
+                       "/trader-exit, /trader-budget and /trader-risk plan longs only.")
     else:
         out.append("%s  %s." % (label, res["reason"]))
         f = res.get("forming")
@@ -660,12 +847,12 @@ def bar_line(b, res):
         if b["slot"] == n_or - 1:
             note = "opening range set: high $%.2f, low $%.2f" % (orr["high"], orr["low"])
     elif t and t["bar_index"] == b["slot"]:
-        note = "TRIGGERED: closed above $%.2f (%+.2f%%). Get in now if you take it: %s, $%.2f" % (
-            lvl, t["pct_over"], t["time"], t["price"])
+        note = "TRIGGERED: closed %s $%.2f (%+.2f%%). Get in now if you take it: %s, $%.2f" % (
+            words(res.get("side", "buy"), res["setup"])[0], lvl, t["pct_over"], t["time"], t["price"])
     elif lvl is None:
         note = ""
-    elif b["c"] > lvl:
-        note = "above $%.2f" % lvl
+    elif beyond(b["c"], lvl, res.get("side", "buy")):
+        note = "%s $%.2f" % (words(res.get("side", "buy"), res["setup"])[0], lvl)
         if res["setup"] == "level" or b["slot"] >= n_or:
             avg = orr.get("avg_volume")
             if res.get("min_volume_x") and avg:
@@ -673,7 +860,7 @@ def bar_line(b, res):
             elif b["end"] < datetime.datetime.combine(b["et"].date(), parse_hhmm(res["no_entries_before"], "x")):
                 note += ", but no entries before %s" % res["no_entries_before"]
     else:
-        note = "$%.2f under $%.2f" % (lvl - b["c"], lvl)
+        note = "$%.2f %s $%.2f" % (abs(lvl - b["c"]), "under" if b["c"] <= lvl else "over", lvl)
     return "%5s bar  closed $%.2f  %s" % (start, b["c"], note)
 
 
@@ -782,8 +969,6 @@ def watch_loop(provider, clock, sleep, emit, opts, every=30, until=None, max_err
 # ---------------------------------------------------------------- commands
 
 def _opts(a, cfg):
-    if a.side in ("sell", "short"):
-        raise EntryError("v2 plans longs only: no short entries. Watch for a buy (--side buy) instead.")
     if a.setup == "orb" and a.level is not None:
         raise EntryError("--level is for --setup level (an orb's level is its range high)")
     if a.min_volume_x is not None and a.min_volume_x <= 0:
@@ -791,7 +976,7 @@ def _opts(a, cfg):
     if a.level is not None and a.level <= 0:
         raise EntryError("--level must be a price above 0")
     return {"setup": a.setup, "or_minutes": a.or_minutes, "interval": a.interval, "level": a.level,
-            "min_volume_x": a.min_volume_x, "cfg": cfg}
+            "min_volume_x": a.min_volume_x, "cfg": cfg, "side": "sell" if a.side in ("sell", "short") else "buy"}
 
 
 def _load(a, sym, now):
@@ -801,7 +986,7 @@ def _load(a, sym, now):
         ch = get_chart(sym, a.interval, offline=a.offline)
         return ch, (utc_of(ch["data_time"]) if ch.get("data_time") else utc_now())
     now = now or utc_now()
-    return get_chart(sym, a.interval, to_eastern(now).date(), a.offline, real_today), now
+    return get_chart(sym, a.interval, to_eastern(now).date(), a.offline, real_today, a.source), now
 
 
 def cmd_check(a):
@@ -839,7 +1024,7 @@ def cmd_watch(a):
     real_today = to_eastern(utc_now()).date()
 
     def provider(now):
-        return get_chart(sym, a.interval, to_eastern(now).date(), a.offline, real_today)
+        return get_chart(sym, a.interval, to_eastern(now).date(), a.offline, real_today, a.source)
 
     until = None
     if a.until:
@@ -883,7 +1068,7 @@ def cmd_watchlist(a):
         try:
             if a.setup == "level" and o["level"] is None:
                 raise EntryError("needs a level: --level PRICE or a \"level\" in the watchlist")
-            if i and not a.offline:
+            if i and not a.offline and a.source == "yahoo":
                 _sleep(PAUSE)
             chart, when = _load(a, sym, now)
             rows.append((sym, evaluate(chart, when, **o), None))
@@ -907,8 +1092,23 @@ def cmd_watchlist(a):
                 ("%+.2f%%" % last["vs_level_pct"]) if last.get("vs_level_pct") is not None else "-"))
         n = sum(1 for _, r, _ in rows if r and r["status"] == "triggered")
         print("%d of %d triggered. Pick one, then: entry.py check <TICKER> --write, and /trader-exit." % (n, len(rows)))
-        print("Free Yahoo bars, unofficial and can lag. Nothing was placed.")
+        print("Capital.com bars, mid of bid and ask. Nothing was placed." if a.source == "capital"
+              else "Free Yahoo bars, unofficial and can lag. Nothing was placed.")
     return 0 if any(r and r["status"] == "triggered" for _, r, _ in rows) else 1
+
+
+def cmd_epics(a):
+    if a.source != "capital":
+        raise EntryError("epics looks up Capital.com market codes: add --source capital")
+    rows = capital_epics(a.term)
+    if not rows:
+        print("Capital.com found no market for %r." % a.term)
+        return 1
+    print("%-14s  %-12s  %-12s  %s" % ("EPIC", "TYPE", "STATUS", "NAME"))
+    for epic, name, typ, status in rows:
+        print("%-14s  %-12s  %-12s  %s" % (epic, typ or "-", status or "-", name or "-"))
+    print("Use the EPIC as the symbol: entry.py check EPIC --source capital")
+    return 0
 
 
 def main(argv=None):
@@ -921,9 +1121,13 @@ def main(argv=None):
         p.add_argument("--interval", choices=["5m", "1m"], default="5m")
         p.add_argument("--level", type=float, help="the price to close above (--setup level)")
         p.add_argument("--min-volume-x", type=float, help="trigger bar volume vs the range bars' average")
-        p.add_argument("--side", default="buy", choices=["buy", "long", "sell", "short"], help="v2: buy only")
+        p.add_argument("--side", default="buy", choices=["buy", "long", "sell", "short"],
+                       help="buy: first close above the range high or level; sell: first close below the range low or level")
+        p.add_argument("--source", choices=["yahoo", "capital"], default=os.environ.get("TRADER_SOURCE") or "yahoo",
+                       help="yahoo (free, can lag) or capital (Capital.com API: CAPITAL_API_KEY, CAPITAL_IDENTIFIER, "
+                            "CAPITAL_PASSWORD; demo unless CAPITAL_DEMO=0)")
         p.add_argument("--now", help='pretend it is this New York time, e.g. "2026-10-19 10:15"')
-        p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON (.json/.json.gz) or a folder")
+        p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart or Capital.com prices JSON (.json/.json.gz) or a folder")
         p.add_argument("--config", default="trader/config.json")
 
     p = sub.add_parser("check", help="the setup's status right now")
@@ -942,12 +1146,15 @@ def main(argv=None):
     common(p)
     p.add_argument("--watchlist", default="trader/watchlist.json")
     p.add_argument("--json", action="store_true")
+    p = sub.add_parser("epics", help="find a Capital.com market code (epic), e.g. epics \"wall street\" --source capital")
+    p.add_argument("term")
+    p.add_argument("--source", choices=["yahoo", "capital"], default="capital")
     a = ap.parse_args(argv)
     if not a.cmd:
         ap.print_help()
         return 1
     try:
-        return {"check": cmd_check, "watch": cmd_watch, "watchlist": cmd_watchlist}[a.cmd](a)
+        return {"check": cmd_check, "watch": cmd_watch, "watchlist": cmd_watchlist, "epics": cmd_epics}[a.cmd](a)
     except EntryError as e:
         print("entry.py: %s" % e, file=sys.stderr)
         return 1

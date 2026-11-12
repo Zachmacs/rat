@@ -2,17 +2,19 @@
 name: trader-entry
 description: >-
   Entry Timer. Watches a setup bar by bar and tells you the moment to get in.
-  Reads free Yahoo 1-minute or 5-minute bars, builds the opening range (the
+  Reads free Yahoo 1-minute or 5-minute bars (or Capital.com's own CFD prices
+  with --source capital, e.g. US30 or SILVER), builds the opening range (the
   first 15 minutes by default) and calls the entry on the first completed bar
   that CLOSES above the range high, or above a level you give it (like a
   20-day high from the scanner), with an optional volume check. Says waiting
   and how far, triggered with the time and the price, expired, or not open
-  yet, and writes trader/entry.json for /trader-exit. Long side only. It never
+  yet, and writes trader/entry.json for /trader-exit. Longs by default;
+  --side sell watches for the first close BELOW the range low. It never
   places an order. Use when the user says "tell me when to get in", "watch
-  TSLA", "has it broken out", "did it break the opening range", "entry
+  TSLA", "watch US30 on Capital", "short the breakdown", "has it broken out", "did it break the opening range", "entry
   signal", "time my entry", "check my watchlist", or after /trader-scanner
   and /trader-news, before /trader-exit.
-argument-hint: "[TICKER] [--setup orb|level] [--interval 5m|1m]"
+argument-hint: "[TICKER or EPIC] [--setup orb|level] [--interval 5m|1m] [--side buy|sell] [--source yahoo|capital]"
 ---
 
 # trader-entry
@@ -33,6 +35,8 @@ python3 "${CLAUDE_SKILL_DIR}/entry.py" check TSLA --setup level --level 371.20
 python3 "${CLAUDE_SKILL_DIR}/entry.py" check TSLA --interval 1m --min-volume-x 1.5
 python3 "${CLAUDE_SKILL_DIR}/entry.py" watch TSLA --until 15:30    # one line per closed bar, stops on the trigger
 python3 "${CLAUDE_SKILL_DIR}/entry.py" watchlist                   # every hit in trader/watchlist.json
+python3 "${CLAUDE_SKILL_DIR}/entry.py" check US30 --source capital --side sell   # Capital.com CFD, short side
+python3 "${CLAUDE_SKILL_DIR}/entry.py" epics "wall street"           # find a Capital.com epic
 ```
 
 Other flags: `--or-minutes N` (default 15), `--json`, `--offline FILE` (a
@@ -91,6 +95,43 @@ day bar by bar without waiting.
 5. Hand off to `/trader-exit` to set the stop and the target BEFORE anything
    is bought.
 
+## Capital.com prices (--source capital)
+
+Yahoo has no CFD prices, and its free bars can lag a minute or two. With
+`--source capital` the tool reads Capital.com's own 1- or 5-minute bars
+(`/api/v1/prices/{epic}`) for the instrument you actually trade: `US30`,
+`SILVER`, `GOLD` and so on. Find an epic with `entry.py epics NAME`.
+
+- **Keys live in environment variables, never in the chat**:
+  `CAPITAL_API_KEY` (Capital.com: Settings > API integrations; 2FA must be
+  on), `CAPITAL_IDENTIFIER` (your login email) and `CAPITAL_PASSWORD` (the
+  custom password you set for that key). `TRADER_SOURCE=capital` makes it
+  the default.
+- **Demo first.** It talks to the demo server unless `CAPITAL_DEMO=0`. The
+  header says DEMO when it is.
+- **Prices are the mid** of bid and ask. You buy at the ask and sell at the
+  bid, so a fill is about half the spread worse than the mid.
+- **Volume** is Capital.com's tick count, not shares: `--min-volume-x`
+  compares ticks with ticks.
+- **The session is still New York's.** The opening range is 9:30-9:45 ET
+  and entries run 9:45-15:30 ET (1:30-7:30 AM in Melbourne in the northern
+  winter), even though a CFD trades nearly around the clock.
+- It only reads prices. It never calls Capital.com's order or position
+  endpoints.
+- Sessions end after 10 idle minutes; it logs in again by itself.
+- In a Claude cloud session the hosts `api-capital.backend-capital.com` and
+  `demo-api-capital.backend-capital.com` must be allowed in the environment's
+  network settings.
+
+## The short side (--side sell)
+
+Mirror image of the long rule: the level is the opening-range LOW (or
+`--level`), and the trigger is the first completed bar that CLOSES below it.
+A close exactly at the low is not below it. `entry.json` gets `"side": "sell"`.
+The rest of the pack plans longs only: /trader-exit refuses a sell entry, and
+/trader-budget, /trader-risk and /trader-broker do not short. For a short, set
+the stop above and the target below in the broker's own app before selling.
+
 ## Example: the reel
 
 TSLA, Monday 2026-10-19, 5-minute bars. The opening range is 354.47 to
@@ -120,7 +161,8 @@ and the trigger moves to 10:35 AM at 365.75 (the 10:30 bar, 7.98x).
   and can lag. Say so when a minute matters.
 - A signal is information, not an order, and not a promise. Nothing here
   promises winning trades or money.
-- Long side only. v2 plans longs only. If the user wants a short, say that.
+- Longs by default. A short is `--side sell`, a signal only: say that the
+  rest of the pack (exit, budget, risk, broker) plans longs only.
 - One trigger per setup per day: the first close above. Later closes do not
   reset it.
 - Never call an entry early because a bar looks like it will close above.
