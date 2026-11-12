@@ -399,18 +399,44 @@ def _capital_error(status, text):
     return "HTTP %d%s" % (status, (" (%s)" % code) if code else "")
 
 
+CAPITAL_KEYS = ("CAPITAL_API_KEY", "CAPITAL_IDENTIFIER", "CAPITAL_PASSWORD")
+
+
+def capital_credentials_path():
+    """A private file in the home folder, outside every repo: never commit it."""
+    return os.environ.get("CAPITAL_CREDENTIALS") or os.path.join(os.path.expanduser("~"), ".trader-capital.json")
+
+
+def capital_credentials():
+    """Environment variables first, then the private file for anything still missing.
+    The file is JSON: {"CAPITAL_API_KEY": "...", "CAPITAL_IDENTIFIER": "...", "CAPITAL_PASSWORD": "..."}."""
+    creds = {k: os.environ.get(k) for k in CAPITAL_KEYS}
+    path = capital_credentials_path()
+    if not all(creds.values()) and os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError) as e:
+            raise EntryError("could not read %s: %s" % (path, e))
+        if not isinstance(doc, dict):
+            raise EntryError("%s must be a JSON object with %s" % (path, ", ".join(CAPITAL_KEYS)))
+        for k in CAPITAL_KEYS:
+            if not creds[k] and doc.get(k):
+                creds[k] = str(doc[k])
+    return creds
+
+
 def capital_login():
     """POST /session with the API key, login and password from the environment.
     Keys live in environment variables, never in the chat or a file in the repo."""
-    key = os.environ.get("CAPITAL_API_KEY")
-    ident = os.environ.get("CAPITAL_IDENTIFIER")
-    pw = os.environ.get("CAPITAL_PASSWORD")
-    missing = [n for n, v in (("CAPITAL_API_KEY", key), ("CAPITAL_IDENTIFIER", ident),
-                              ("CAPITAL_PASSWORD", pw)) if not v]
+    creds = capital_credentials()
+    key, ident, pw = creds["CAPITAL_API_KEY"], creds["CAPITAL_IDENTIFIER"], creds["CAPITAL_PASSWORD"]
+    missing = [n for n, v in sorted(creds.items()) if not v]
     if missing:
-        raise EntryError("--source capital needs %s in the environment (the API key from Capital.com's "
-                         "Settings > API integrations, your login email and the key's custom password)"
-                         % ", ".join(missing))
+        raise EntryError("--source capital needs %s: put them in %s (see SKILL.md) or in environment "
+                         "variables (the API key from Capital.com's Settings > API integrations, the "
+                         "account's login email and the key's custom password)"
+                         % (", ".join(missing), capital_credentials_path()))
     base = capital_base()
     status, hdr, text = _capital_http("POST", base + "/session", {"X-CAP-API-KEY": key},
                                       {"identifier": ident, "password": pw, "encryptedPassword": False})

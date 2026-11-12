@@ -221,6 +221,31 @@ class CapitalHttp(unittest.TestCase):
                          lambda: entry.get_chart("NOPE", "5m", DAY, source="capital", today=DAY))
         self.assertIn("epics", str(e.exception))
 
+    def test_credentials_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "capital.json")
+            with open(f, "w") as fh:
+                json.dump({"CAPITAL_API_KEY": "k", "CAPITAL_IDENTIFIER": "me@example.com", "CAPITAL_PASSWORD": "pw"}, fh)
+            fake = FakeCapital(cap_day(DAY, [105]))
+            ch = self.run_env({"CAPITAL_CREDENTIALS": f}, fake,
+                              lambda: entry.get_chart("US30", "5m", DAY, source="capital", today=DAY))
+        self.assertEqual(len(ch["bars"]), 1)
+        self.assertEqual(fake.logins, 1)
+
+    def test_environment_beats_the_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "capital.json")
+            with open(f, "w") as fh:
+                json.dump({"CAPITAL_API_KEY": "file", "CAPITAL_IDENTIFIER": "x", "CAPITAL_PASSWORD": "y"}, fh)
+            with mock.patch.dict(os.environ, dict(ENV, CAPITAL_CREDENTIALS=f), clear=True):
+                self.assertEqual(entry.capital_credentials()["CAPITAL_API_KEY"], "k")
+
+    def test_missing_file_says_where(self):
+        with mock.patch.dict(os.environ, {"CAPITAL_CREDENTIALS": "/nonexistent/capital.json"}, clear=True):
+            with self.assertRaises(entry.EntryError) as e:
+                entry.capital_login()
+        self.assertIn("/nonexistent/capital.json", str(e.exception))
+
     def test_epics(self):
         rows = self.run_env(ENV, FakeCapital({}), lambda: entry.capital_epics("wall street"))
         self.assertEqual(rows[0][0], "US30")

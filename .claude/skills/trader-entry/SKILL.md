@@ -106,7 +106,10 @@ Yahoo has no CFD prices, and its free bars can lag a minute or two. With
   `CAPITAL_API_KEY` (Capital.com: Settings > API integrations; 2FA must be
   on), `CAPITAL_IDENTIFIER` (your login email) and `CAPITAL_PASSWORD` (the
   custom password you set for that key). `TRADER_SOURCE=capital` makes it
-  the default.
+  the default. Instead of environment variables, the same three names can go
+  in a private JSON file in the home folder, `~/.trader-capital.json` (or the
+  path in `CAPITAL_CREDENTIALS`), outside the repo. Never put a key in the
+  code, a file in the repo, or the chat.
 - **Demo first.** It talks to the demo server unless `CAPITAL_DEMO=0`. The
   header says DEMO when it is.
 - **Prices are the mid** of bid and ask. You buy at the ask and sell at the
