@@ -1,0 +1,22 @@
+{
+  "created_by": "trader-entry",
+  "symbol": "^DJI",
+  "setup": "orb",
+  "side": "buy",
+  "date": "2026-11-12",
+  "status": "triggered",
+  "time": "11:05 AM",
+  "bar_start": "11:00",
+  "bar_index": 18,
+  "price": 52621.03,
+  "level": 52617.07,
+  "interval": "5m",
+  "opening_range": {
+    "high": 52617.07,
+    "low": 52427.94,
+    "minutes": 15
+  },
+  "source": "yahoo",
+  "checked_at": "2026-11-12T16:05:02Z",
+  "reason": "the 11:00 bar closed above the range high"
+}
